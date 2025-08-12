@@ -115,6 +115,11 @@ def gantt(df, date_mode="Plan", color_by="Estado"):
     return fig
 
 # -------- Carga de datos (sin uploader) --------
+# -------- Carga de datos (local / uploader / SharePoint) --------
+from io import BytesIO
+import requests
+import urllib.parse
+
 DEFAULT_XLSX = Path(__file__).parent / "linea_tiempo_proyecto_eolico.xlsx"
 FALLBACK_XLSX = Path.home() / "Desktop" / "Linea de tiempo" / "linea_tiempo_proyecto_eolico.xlsx"
 
@@ -146,7 +151,6 @@ def process_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Piloto (10 kW / 55 kW)
     df["Piloto"] = df.apply(infer_piloto, axis=1)
-
     return df
 
 @st.cache_data
@@ -165,20 +169,71 @@ def load_with_fallback(path_text: str) -> pd.DataFrame:
     st.error(f"No encuentro el Excel.\nIntentado:\n- {p}\n- {DEFAULT_XLSX}\n- {FALLBACK_XLSX}")
     st.stop()
 
-# -------- Sidebar --------
-st.sidebar.title("⚙️ Control")
-today = st.sidebar.date_input("Fecha de referencia (hoy)", value=date.today(), key="today")
-st.sidebar.markdown("**Excel de línea de tiempo (ruta):**")
-custom_path = st.sidebar.text_input("Ruta del Excel", value=str(DEFAULT_XLSX), help="Si no está aquí, se intenta en ~/Desktop/Linea de tiempo/...")
-use_manual_upload = st.sidebar.checkbox("Usar carga manual (uploader)", value=False)
+# --- Helpers SharePoint (link público) ---
+def to_direct_download(url: str) -> str:
+    """Convierte links de OneDrive/SharePoint a descarga directa (añade ?download=1 o usa download.aspx)."""
+    if not url:
+        return url
+    if "download=1" in url:
+        return url
+    # Caso simple: tiene query (?e=..., ?web=1, etc.) -> sustituir por download=1
+    if "?" in url and ("/_layouts/15/" not in url):
+        base = url.split("?", 1)[0]
+        return base + "?download=1"
+    # Caso /:x:/g/ o /:w:/g/ -> usar download.aspx?SourceUrl=
+    if "/:x:/" in url or "/:w:/" in url:
+        src = url.split("?", 1)[0]
+        parsed = urllib.parse.urlparse(url)
+        host = f"{parsed.scheme}://{parsed.netloc}"
+        return f"{host}/_layouts/15/download.aspx?SourceUrl=" + urllib.parse.quote(src, safe="")
+    return url
 
-if use_manual_upload:
-    uploaded = st.sidebar.file_uploader("Sube el Excel", type=["xlsx"])
+@st.cache_data
+def load_from_sharepoint_url(share_url: str) -> pd.DataFrame:
+    direct = to_direct_download(share_url)
+    r = requests.get(direct, timeout=60)
+    r.raise_for_status()
+    return process_df(pd.read_excel(BytesIO(r.content)))
+
+
+# -------- Sidebar --------
+# -------- Sidebar: selector de fuente y carga --------
+st.sidebar.markdown("**Fuente de datos**")
+source = st.sidebar.radio(
+    "Selecciona origen",
+    ["SharePoint (link público)", "Subir archivo", "Local (ruta)"],
+    index=0,  # por defecto SharePoint
+)
+
+if source == "SharePoint (link público)":
+    sp_url = st.sidebar.text_input(
+        "URL de SharePoint/OneDrive",
+        value="https://correouss-my.sharepoint.com/:x:/g/personal/ext_jonathan_diaz_uss_cl/EfH9xhV2cd9NnMNKPD6WZAkBF8P03c2DV-qlRG-SR6451A?e=ICdZAP",
+        help="Pega el vínculo para compartir (lo convertimos a descarga directa automáticamente).",
+    )
+    if not sp_url:
+        st.stop()
+    try:
+        df = load_from_sharepoint_url(sp_url)
+    except Exception as e:
+        st.error(f"No pude leer el Excel desde SharePoint.\nDetalles: {e}")
+        st.stop()
+
+elif source == "Subir archivo":
+    uploaded = st.sidebar.file_uploader("Sube el Excel (.xlsx)", type=["xlsx"])
     if uploaded is None:
         st.stop()
     df = process_df(pd.read_excel(uploaded))
-else:
+
+else:  # Local (ruta)
+    st.sidebar.markdown("**Excel de línea de tiempo (ruta):**")
+    custom_path = st.sidebar.text_input(
+        "Ruta del Excel",
+        value=str(DEFAULT_XLSX),
+        help="Si no está aquí, se intenta en ~/Desktop/Linea de tiempo/...",
+    )
     df = load_with_fallback(custom_path)
+
 
 # -------- Filtros (incluye Piloto) --------
 cols_filter = st.sidebar.container()
