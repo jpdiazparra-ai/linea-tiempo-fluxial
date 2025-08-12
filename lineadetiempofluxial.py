@@ -7,9 +7,16 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import networkx as nx
 from datetime import date
 from pathlib import Path
+
+# Ejemplo de función que requiere networkx
+def generar_grafo(data):
+    import networkx as nx  # Se importa solo cuando se usa
+    G = nx.Graph()
+    # Resto del código que crea el grafo...
+    return G
+
 
 st.set_page_config(page_title="Línea de Tiempo Proyecto Eólico", layout="wide")
 
@@ -151,6 +158,19 @@ except Exception as e:
     st.stop()
 
 # -------- Filtros (incluye Piloto) --------
+# ---- Control de actualización ----
+if "refresh_key" not in st.session_state:
+    st.session_state.refresh_key = 0
+
+if st.sidebar.button("🔄 Actualizar datos (limpiar caché)"):
+    st.session_state.refresh_key += 1
+    st.cache_data.clear()
+    st.toast("Datos actualizados desde la fuente")
+    st.rerun()
+
+st.sidebar.caption(f"Última actualización: {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
+
+# ---- Contenedor de filtros ----
 cols_filter = st.sidebar.container()
 fases = sorted(df["Fase"].dropna().unique().tolist()) if "Fase" in df.columns else []
 lineas = sorted(df["Línea"].dropna().unique().tolist()) if "Línea" in df.columns else []
@@ -172,6 +192,7 @@ mask = (
     & df["Estado"].isin(sel_estado)
 )
 fdf = df[mask].copy()
+
 
 # -------- KPIs --------
 st.title("🚀 Tablero Proyecto Eólico")
@@ -197,6 +218,87 @@ col6.metric("Atrasadas", late)
 if not np.isnan(progress_avg):
     st.progress(float(progress_avg)/100.0, text=f"Avance promedio: {progress_avg:.0f}%")
 
+# -------- Tabs / Ruta crítica y Riesgos (version segura sin fallar si falta networkx) --------
+
+def build_graph(df):
+    """Construye el grafo de dependencias. Si no hay networkx, devuelve un grafo 'dummy'."""
+    try:
+        import networkx as nx  # import local
+    except ImportError:
+        class DummyGraph:
+            def __len__(self): return 0
+            def nodes(self, data=False): return []
+            def edges(self, data=False): return []
+            def out_degree(self): return []
+            def in_degree(self): return []
+        return DummyGraph()
+
+    G = nx.DiGraph()
+    for _, r in df.iterrows():
+        if pd.isna(r.get("ID")):
+            continue
+        dur = r.get("DuraciónPlan(d)")
+        dur = int(dur) if pd.notna(dur) else 1
+        G.add_node(int(r["ID"]), duration=max(1, dur))
+
+    for _, r in df.iterrows():
+        if pd.isna(r.get("ID")):
+            continue
+        i = int(r["ID"])
+        for d in r.get("_deps", []):
+            if d in G.nodes:
+                G.add_edge(int(d), i)
+    return G
+
+
+def longest_path_by_duration(G):
+    """Calcula ruta crítica por duración. Seguro aunque no haya networkx o el grafo sea dummy."""
+    try:
+        import networkx as nx  # import local
+    except ImportError:
+        return [], 0
+
+    try:
+        if G is None or len(G) == 0:
+            return [], 0
+    except Exception:
+        return [], 0
+
+    H = nx.DiGraph()
+    for n, data in G.nodes(data=True):
+        H.add_node(n, duration=data.get("duration", 1))
+    for u, v in G.edges():
+        H.add_edge(u, v, w=G.nodes[v].get("duration", 1))
+
+    try:
+        order = list(nx.topological_sort(H))
+    except nx.NetworkXUnfeasible:
+        return [], 0  # hay ciclos
+
+    dist = {n: H.nodes[n].get("duration", 1) for n in H.nodes()}
+    prev = {n: None for n in H.nodes()}
+
+    for n in order:
+        for _, v, data in H.out_edges(n, data=True):
+            w = data.get("w", 1)
+            if dist[n] + w > dist[v]:
+                dist[v] = dist[n] + w
+                prev[v] = n
+
+    if not dist:
+        return [], 0
+    end = max(dist, key=dist.get)
+    path, cur = [], end
+    while cur is not None:
+        path.append(cur)
+        cur = prev[cur]
+    path.reverse()
+    return path, dist[end]
+
+
+# Construir el grafo UNA SOLA VEZ (fdf ya debe existir)
+G = build_graph(fdf)
+
 # -------- Tabs --------
 tab_timeline, tab_burnup, tab_crit, tab_risk, tab_table = st.tabs(
     ["📅 Línea de tiempo", "📈 Burn‑up / Avance", "🧩 Ruta crítica", "⚠️ Riesgos", "📋 Tabla"]
@@ -220,7 +322,7 @@ with tab_burnup:
     if not df_burn.empty:
         daily = df_burn.groupby("_fecha_done")["ID"].count().rename("Completadas_día")
         cum = daily.cumsum().rename("Completadas_acum").to_frame()
-        cum["Totales"] = total
+        cum["Totales"] = len(fdf)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=cum.index, y=cum["Completadas_acum"], mode="lines+markers", name="Completadas acum"))
         fig.add_trace(go.Scatter(x=cum.index, y=cum["Totales"], mode="lines", name="Total tareas", line=dict(dash="dash")))
@@ -229,90 +331,54 @@ with tab_burnup:
     else:
         st.info("Aún no hay tareas con fecha de término para graficar el burn‑up.")
 
-def build_graph(df):
-    G = nx.DiGraph()
-    for _, r in df.iterrows():
-        if pd.isna(r["ID"]):
-            continue
-        dur = r.get("DuraciónPlan(d)")
-        dur = int(dur) if pd.notna(dur) else 1
-        G.add_node(int(r["ID"]), duration=max(1, dur))
-    for _, r in df.iterrows():
-        if pd.isna(r["ID"]):
-            continue
-        i = int(r["ID"])
-        for d in r["_deps"]:
-            if d in G.nodes:
-                G.add_edge(int(d), i)
-    return G
-
-def longest_path_by_duration(G):
-    H = nx.DiGraph()
-    for n, data in G.nodes(data=True):
-        H.add_node(n, duration=data.get("duration", 1))
-    for u, v in G.edges():
-        H.add_edge(u, v, w=G.nodes[v].get("duration", 1))
-    try:
-        order = list(nx.topological_sort(H))
-    except nx.NetworkXUnfeasible:
-        return [], 0
-    dist = {n: H.nodes[n].get("duration", 1) for n in H.nodes()}
-    prev = {n: None for n in H.nodes()}
-    for n in order:
-        for _, v, data in H.out_edges(n, data=True):
-            w = data["w"]
-            if dist[n] + w > dist[v]:
-                dist[v] = dist[n] + w
-                prev[v] = n
-    if not dist:
-        return [], 0
-    end = max(dist, key=dist.get)
-    path, cur = [], end
-    while cur is not None:
-        path.append(cur)
-        cur = prev[cur]
-    path.reverse()
-    return path, dist[end]
-
 with tab_crit:
     st.subheader("Ruta crítica (por duración planificada)")
-    G = build_graph(fdf)
-    path, total_dur = longest_path_by_duration(G)
-    if path:
-        # 1) deduplicar por ID (si hay repetidos en fdf)
-        df_unique = fdf.dropna(subset=["ID"]).drop_duplicates(subset=["ID"], keep="first").copy()
+    try:
+        graf_vacio = (G is None or len(G) == 0)
+    except Exception:
+        graf_vacio = True
 
-        # 2) filtrar solo IDs de la ruta y ordenar según 'path'
-        df_path = df_unique[df_unique["ID"].astype(int).isin(path)].copy()
-        df_path["ID"] = df_path["ID"].astype(int)
-        df_path["__order"] = pd.Categorical(df_path["ID"], categories=path, ordered=True)
-        df_path = df_path.sort_values("__order")
-
-        # 3) columnas necesarias
-        cols_needed = ["Tarea / Entregable", DATE_COL_START, DATE_COL_END_PLAN, "DuraciónPlan(d)"]
-        cols_needed = [c for c in cols_needed if c in df_path.columns]
-        df_path = df_path[["ID"] + cols_needed].reset_index(drop=True)
-        df_path["Orden"] = range(1, len(df_path)+1)
-
-        colA, colB = st.columns([2,1])
-        with colA:
-            st.markdown("**Secuencia (ID → Tarea)**")
-            st.table(df_path[["Orden","ID","Tarea / Entregable","DuraciónPlan(d)"]])
-        with colB:
-            st.metric("Duración total ruta crítica (días)", int(total_dur))
-
-        fig_cp = px.timeline(df_path, x_start=DATE_COL_START, x_end=DATE_COL_END_PLAN, y="Tarea / Entregable",
-                             color_discrete_sequence=["#d62728"])
-        fig_cp.update_yaxes(autorange="reversed")
-        fig_cp.update_layout(height=350, margin=dict(l=5, r=5, t=30, b=5), showlegend=False)
-        st.plotly_chart(fig_cp, use_container_width=True)
+    if graf_vacio:
+        st.info("Ruta crítica no disponible (falta 'networkx' o no hay dependencias).")
     else:
-        st.warning("No se pudo calcular la ruta crítica (revisa que no existan ciclos en dependencias).")
+        path, total_dur = longest_path_by_duration(G)
+        if path:
+            df_unique = fdf.dropna(subset=["ID"]).drop_duplicates(subset=["ID"], keep="first").copy()
+            df_path = df_unique[df_unique["ID"].astype(int).isin(path)].copy()
+            df_path["ID"] = df_path["ID"].astype(int)
+            df_path["__order"] = pd.Categorical(df_path["ID"], categories=path, ordered=True)
+            df_path = df_path.sort_values("__order")
+
+            cols_needed = ["Tarea / Entregable", DATE_COL_START, DATE_COL_END_PLAN, "DuraciónPlan(d)"]
+            cols_needed = [c for c in cols_needed if c in df_path.columns]
+            df_path = df_path[["ID"] + cols_needed].reset_index(drop=True)
+            df_path["Orden"] = range(1, len(df_path)+1)
+
+            colA, colB = st.columns([2,1])
+            with colA:
+                st.markdown("**Secuencia (ID → Tarea)**")
+                st.table(df_path[["Orden","ID","Tarea / Entregable","DuraciónPlan(d)"]])
+            with colB:
+                st.metric("Duración total ruta crítica (días)", int(total_dur))
+
+            fig_cp = px.timeline(
+                df_path, x_start=DATE_COL_START, x_end=DATE_COL_END_PLAN, y="Tarea / Entregable",
+                color_discrete_sequence=["#d62728"]
+            )
+            fig_cp.update_yaxes(autorange="reversed")
+            fig_cp.update_layout(height=350, margin=dict(l=5, r=5, t=30, b=5), showlegend=False)
+            st.plotly_chart(fig_cp, use_container_width=True)
+        else:
+            st.warning("No se pudo calcular la ruta crítica (verifica dependencias o ciclos).")
 
 with tab_risk:
     st.subheader("Matriz de riesgos (probabilidad vs impacto)")
-    out_degree = dict(G.out_degree())
-    # impacto: alto si es hito o tiene >=2 dependientes, medio si ==1, bajo si 0
+    # out_degree seguro (funciona con grafo real o dummy)
+    try:
+        out_degree = dict(G.out_degree()) if (G is not None and len(G) > 0) else {}
+    except Exception:
+        out_degree = {}
+
     def _impact_for_id(i):
         try:
             is_hito = str(fdf.set_index("ID").loc[int(i), "Hito (S/N)"]).upper() == "S"
@@ -322,6 +388,7 @@ with tab_risk:
         return 3 if (deg >= 2 or is_hito) else (2 if deg == 1 else 1)
 
     fdf["_impact_tmp"] = fdf["ID"].map(lambda i: _impact_for_id(i) if pd.notna(i) else 1)
+
     probs, imps = [], []
     for _, r in fdf.iterrows():
         p, im = compute_risk(r, st.session_state.today)
@@ -369,4 +436,3 @@ with st.expander("🧠 Recomendaciones de uso"):
 - **Fechas reales**: al completar `Fin real`, el burn‑up y el modo “Real” del Gantt reflejan avance efectivo.
 - **Campos extra sugeridos**: `Prioridad`, `NivelRiesgo`, `CostoPlan`, `CostoReal`, `CriterioAceptacion`, `EvidenciaURL`.
     """)
-
