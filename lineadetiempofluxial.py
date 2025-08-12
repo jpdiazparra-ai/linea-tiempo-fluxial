@@ -1,6 +1,6 @@
 # app.py
-# Requisitos: streamlit, pandas, plotly, numpy, networkx, python-dateutil, openpyxl
-# pip install streamlit pandas plotly numpy networkx python-dateutil openpyxl
+# Requisitos: streamlit, pandas, plotly, numpy, networkx, python-dateutil
+# pip3 install streamlit pandas plotly numpy networkx python-dateutil
 
 import streamlit as st
 import pandas as pd
@@ -9,10 +9,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import networkx as nx
 from datetime import date
-from dateutil import parser
 from pathlib import Path
 
 st.set_page_config(page_title="Línea de Tiempo Proyecto Eólico", layout="wide")
+
+# -------- Config fuente de datos (Google Sheets CSV) --------
+GSHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQ3l1P_rQzwYqDter4G4tuM4z7ZvoOGruhh__QfIigyQeDNgJqF-qDYs0z7zjjL-mwblzejzotblwtr/pub?gid=0&single=true&output=csv"
 
 # -------- Helpers --------
 DATE_COL_START = "Inicio (AAAA-MM-DD)"
@@ -47,32 +49,23 @@ def status_color(s):
     return "#7f7f7f"      # gris
 
 def infer_piloto(row):
-    """
-    Si existe columna 'Piloto' en el Excel se respeta.
-    Si el texto menciona 55/55kW/55 k -> Piloto 55 kW.
-    Si ID está en {24,25} -> Piloto 55 kW (según tu plan).
-    En otro caso -> Piloto 10 kW.
-    """
+    """Infiera Piloto 10/55 kW si no viene explícito."""
     val = str(row.get("Piloto", "")).strip()
     if val:
         return val
-
     texto = " ".join([
         str(row.get("Fase", "")),
         str(row.get("Línea", "")),
         str(row.get("Tarea / Entregable", "")),
         str(row.get("Método", "")),
     ]).lower()
-
     if "55" in texto or "55kw" in texto or "55 k" in texto or "55 k" in texto:
         return "Piloto 55 kW"
-
     try:
         if int(row.get("ID", 0)) in {24, 25}:
             return "Piloto 55 kW"
     except Exception:
         pass
-
     return "Piloto 10 kW"
 
 def compute_risk(row, today):
@@ -97,10 +90,8 @@ def compute_risk(row, today):
 def gantt(df, date_mode="Plan", color_by="Estado"):
     start = df[DATE_COL_START]
     end = df[DATE_COL_END_REAL].fillna(df[DATE_COL_END_PLAN]) if date_mode == "Real" else df[DATE_COL_END_PLAN]
-
     color_arg = color_by if color_by in df.columns else "Estado"
     color_map = {s: status_color(s) for s in df["Estado"].dropna().unique()} if color_by == "Estado" else None
-
     fig = px.timeline(
         df,
         x_start=start,
@@ -114,126 +105,50 @@ def gantt(df, date_mode="Plan", color_by="Estado"):
     fig.update_layout(margin=dict(l=5, r=5, t=40, b=5), height=600, legend_title=color_by, xaxis_title="Fecha", yaxis_title=None)
     return fig
 
-# -------- Carga de datos (sin uploader) --------
-# -------- Carga de datos (local / uploader / SharePoint) --------
-from io import BytesIO
-import requests
-import urllib.parse
-
-DEFAULT_XLSX = Path(__file__).parent / "linea_tiempo_proyecto_eolico.xlsx"
-FALLBACK_XLSX = Path.home() / "Desktop" / "Linea de tiempo" / "linea_tiempo_proyecto_eolico.xlsx"
-
 def process_df(df: pd.DataFrame) -> pd.DataFrame:
     # IDs
     if "ID" in df.columns:
         df["ID"] = pd.to_numeric(df["ID"], errors="coerce").astype("Int64")
-
     # Fechas a datetime
     for c in [DATE_COL_START, DATE_COL_END_PLAN, DATE_COL_END_REAL]:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], errors="coerce")
         else:
             df[c] = pd.NaT
-
-    # 'Depende de' seguro para Arrow/pyarrow (no mezclar int/str)
+    # 'Depende de' robusto
     if "Depende de" in df.columns:
         df["Depende de"] = df["Depende de"].apply(lambda v: "" if pd.isna(v) else (",".join(map(str, parse_dependencies(v)))))
         df["_deps"] = df["Depende de"].apply(parse_dependencies)
     else:
         df["Depende de"] = ""
         df["_deps"] = [[] for _ in range(len(df))]
-
     # Duraciones
     df["DuraciónPlan(d)"] = (df[DATE_COL_END_PLAN] - df[DATE_COL_START]).dt.days
     df["DuraciónReal(d)"] = (df[DATE_COL_END_REAL] - df[DATE_COL_START]).dt.days
     df["DuraciónPlan(d)"] = pd.to_numeric(df["DuraciónPlan(d)"], errors="coerce")
     df["DuraciónReal(d)"] = pd.to_numeric(df["DuraciónReal(d)"], errors="coerce")
-
-    # Piloto (10 kW / 55 kW)
+    # Piloto
     df["Piloto"] = df.apply(infer_piloto, axis=1)
     return df
 
 @st.cache_data
-def load_data_from_path(xlsx_path: Path) -> pd.DataFrame:
-    df = pd.read_excel(xlsx_path)  # requiere openpyxl
+def load_from_gsheet_csv(csv_url: str) -> pd.DataFrame:
+    """Lee Google Sheets publicado como CSV (link público)."""
+    df = pd.read_csv(csv_url, encoding="utf-8-sig")
     return process_df(df)
 
-def load_with_fallback(path_text: str) -> pd.DataFrame:
-    p = Path(path_text).expanduser()
-    if p.exists():
-        return load_data_from_path(p)
-    for alt in [DEFAULT_XLSX, FALLBACK_XLSX]:
-        if alt.exists():
-            st.sidebar.info(f"Usando archivo: {alt}")
-            return load_data_from_path(alt)
-    st.error(f"No encuentro el Excel.\nIntentado:\n- {p}\n- {DEFAULT_XLSX}\n- {FALLBACK_XLSX}")
-    st.stop()
-
-# --- Helpers SharePoint (link público) ---
-def to_direct_download(url: str) -> str:
-    """Convierte links de OneDrive/SharePoint a descarga directa (añade ?download=1 o usa download.aspx)."""
-    if not url:
-        return url
-    if "download=1" in url:
-        return url
-    # Caso simple: tiene query (?e=..., ?web=1, etc.) -> sustituir por download=1
-    if "?" in url and ("/_layouts/15/" not in url):
-        base = url.split("?", 1)[0]
-        return base + "?download=1"
-    # Caso /:x:/g/ o /:w:/g/ -> usar download.aspx?SourceUrl=
-    if "/:x:/" in url or "/:w:/" in url:
-        src = url.split("?", 1)[0]
-        parsed = urllib.parse.urlparse(url)
-        host = f"{parsed.scheme}://{parsed.netloc}"
-        return f"{host}/_layouts/15/download.aspx?SourceUrl=" + urllib.parse.quote(src, safe="")
-    return url
-
-@st.cache_data
-def load_from_sharepoint_url(share_url: str) -> pd.DataFrame:
-    direct = to_direct_download(share_url)
-    r = requests.get(direct, timeout=60)
-    r.raise_for_status()
-    return process_df(pd.read_excel(BytesIO(r.content)))
-
-
 # -------- Sidebar --------
-# -------- Sidebar: selector de fuente y carga --------
-st.sidebar.markdown("**Fuente de datos**")
-source = st.sidebar.radio(
-    "Selecciona origen",
-    ["SharePoint (link público)", "Subir archivo", "Local (ruta)"],
-    index=0,  # por defecto SharePoint
-)
+st.sidebar.title("⚙️ Control")
+# Mostrar la fuente (solo lectura)
+st.sidebar.text_input("Fuente de datos (Google Sheets CSV):", GSHEET_CSV_URL, disabled=True)
+today = st.sidebar.date_input("Fecha de referencia (hoy)", value=date.today(), key="today")
 
-if source == "SharePoint (link público)":
-    sp_url = st.sidebar.text_input(
-        "URL de SharePoint/OneDrive",
-        value="https://correouss-my.sharepoint.com/:x:/g/personal/ext_jonathan_diaz_uss_cl/EfH9xhV2cd9NnMNKPD6WZAkBF8P03c2DV-qlRG-SR6451A?e=ICdZAP",
-        help="Pega el vínculo para compartir (lo convertimos a descarga directa automáticamente).",
-    )
-    if not sp_url:
-        st.stop()
-    try:
-        df = load_from_sharepoint_url(sp_url)
-    except Exception as e:
-        st.error(f"No pude leer el Excel desde SharePoint.\nDetalles: {e}")
-        st.stop()
-
-elif source == "Subir archivo":
-    uploaded = st.sidebar.file_uploader("Sube el Excel (.xlsx)", type=["xlsx"])
-    if uploaded is None:
-        st.stop()
-    df = process_df(pd.read_excel(uploaded))
-
-else:  # Local (ruta)
-    st.sidebar.markdown("**Excel de línea de tiempo (ruta):**")
-    custom_path = st.sidebar.text_input(
-        "Ruta del Excel",
-        value=str(DEFAULT_XLSX),
-        help="Si no está aquí, se intenta en ~/Desktop/Linea de tiempo/...",
-    )
-    df = load_with_fallback(custom_path)
-
+# Carga SIEMPRE desde el Google Sheet
+try:
+    df = load_from_gsheet_csv(GSHEET_CSV_URL)
+except Exception as e:
+    st.error(f"No pude leer el CSV de Google Sheets.\nDetalles: {e}")
+    st.stop()
 
 # -------- Filtros (incluye Piloto) --------
 cols_filter = st.sidebar.container()
@@ -317,10 +232,14 @@ with tab_burnup:
 def build_graph(df):
     G = nx.DiGraph()
     for _, r in df.iterrows():
+        if pd.isna(r["ID"]):
+            continue
         dur = r.get("DuraciónPlan(d)")
         dur = int(dur) if pd.notna(dur) else 1
         G.add_node(int(r["ID"]), duration=max(1, dur))
     for _, r in df.iterrows():
+        if pd.isna(r["ID"]):
+            continue
         i = int(r["ID"])
         for d in r["_deps"]:
             if d in G.nodes:
@@ -345,6 +264,8 @@ def longest_path_by_duration(G):
             if dist[n] + w > dist[v]:
                 dist[v] = dist[n] + w
                 prev[v] = n
+    if not dist:
+        return [], 0
     end = max(dist, key=dist.get)
     path, cur = [], end
     while cur is not None:
@@ -358,14 +279,28 @@ with tab_crit:
     G = build_graph(fdf)
     path, total_dur = longest_path_by_duration(G)
     if path:
-        df_path = fdf.set_index("ID").loc[path, ["Tarea / Entregable", DATE_COL_START, DATE_COL_END_PLAN, "DuraciónPlan(d)"]].reset_index()
+        # 1) deduplicar por ID (si hay repetidos en fdf)
+        df_unique = fdf.dropna(subset=["ID"]).drop_duplicates(subset=["ID"], keep="first").copy()
+
+        # 2) filtrar solo IDs de la ruta y ordenar según 'path'
+        df_path = df_unique[df_unique["ID"].astype(int).isin(path)].copy()
+        df_path["ID"] = df_path["ID"].astype(int)
+        df_path["__order"] = pd.Categorical(df_path["ID"], categories=path, ordered=True)
+        df_path = df_path.sort_values("__order")
+
+        # 3) columnas necesarias
+        cols_needed = ["Tarea / Entregable", DATE_COL_START, DATE_COL_END_PLAN, "DuraciónPlan(d)"]
+        cols_needed = [c for c in cols_needed if c in df_path.columns]
+        df_path = df_path[["ID"] + cols_needed].reset_index(drop=True)
         df_path["Orden"] = range(1, len(df_path)+1)
+
         colA, colB = st.columns([2,1])
         with colA:
             st.markdown("**Secuencia (ID → Tarea)**")
             st.table(df_path[["Orden","ID","Tarea / Entregable","DuraciónPlan(d)"]])
         with colB:
             st.metric("Duración total ruta crítica (días)", int(total_dur))
+
         fig_cp = px.timeline(df_path, x_start=DATE_COL_START, x_end=DATE_COL_END_PLAN, y="Tarea / Entregable",
                              color_discrete_sequence=["#d62728"])
         fig_cp.update_yaxes(autorange="reversed")
@@ -377,15 +312,20 @@ with tab_crit:
 with tab_risk:
     st.subheader("Matriz de riesgos (probabilidad vs impacto)")
     out_degree = dict(G.out_degree())
-    fdf["_impact_tmp"] = fdf["ID"].map(
-        lambda i: 3 if (out_degree.get(int(i),0)>=2 or str(fdf.set_index('ID').loc[int(i), "Hito (S/N)"]).upper()=="S")
-        else (2 if out_degree.get(int(i),0)==1 else 1)
-    )
+    # impacto: alto si es hito o tiene >=2 dependientes, medio si ==1, bajo si 0
+    def _impact_for_id(i):
+        try:
+            is_hito = str(fdf.set_index("ID").loc[int(i), "Hito (S/N)"]).upper() == "S"
+        except Exception:
+            is_hito = False
+        deg = out_degree.get(int(i), 0)
+        return 3 if (deg >= 2 or is_hito) else (2 if deg == 1 else 1)
+
+    fdf["_impact_tmp"] = fdf["ID"].map(lambda i: _impact_for_id(i) if pd.notna(i) else 1)
     probs, imps = [], []
     for _, r in fdf.iterrows():
         p, im = compute_risk(r, st.session_state.today)
-        probs.append(p)
-        imps.append(im)
+        probs.append(p); imps.append(im)
     fdf["Probabilidad(1-3)"] = probs
     fdf["Impacto(1-3)"] = imps
     fdf["Severidad"] = fdf["Probabilidad(1-3)"] * fdf["Impacto(1-3)"]
@@ -394,10 +334,11 @@ with tab_risk:
     for i in range(1,4):
         for j in range(1,4):
             fig_r.add_shape(type="rect", x0=i-0.5, x1=i+0.5, y0=j-0.5, y1=j+0.5,
-                            line=dict(width=1, color="#cccccc"), fillcolor="rgba(240,240,240,0.4)")
+                            line=dict(width=1, color="#cccccc"),
+                            fillcolor="rgba(240,240,240,0.4)")
     fig_r.add_trace(go.Scatter(
         x=fdf["Probabilidad(1-3)"], y=fdf["Impacto(1-3)"], mode="markers+text",
-        text=fdf["ID"].astype(str), textposition="top center",
+        text=fdf["ID"].fillna("").astype(str), textposition="top center",
         marker=dict(size=12, line=dict(width=1, color="#333"), color=fdf["Severidad"]),
         hovertext=fdf["Tarea / Entregable"], hoverinfo="text"
     ))
@@ -423,8 +364,9 @@ with tab_table:
 
 with st.expander("🧠 Recomendaciones de uso"):
     st.markdown("""
-- **Piloto**: filtra por *Piloto 10 kW* o *Piloto 55 kW* desde la barra lateral. Si no viene en el Excel, se infiere automáticamente.
+- **Fuente**: esta app lee automáticamente el CSV público de Google Sheets configurado arriba.
 - **Depende de**: usa IDs separados por coma (ej. `8,14`).
 - **Fechas reales**: al completar `Fin real`, el burn‑up y el modo “Real” del Gantt reflejan avance efectivo.
-- **Campos extra**: `Prioridad`, `NivelRiesgo`, `CostoPlan`, `CostoReal`, `CriterioAceptacion`, `EvidenciaURL`.
+- **Campos extra sugeridos**: `Prioridad`, `NivelRiesgo`, `CostoPlan`, `CostoReal`, `CriterioAceptacion`, `EvidenciaURL`.
     """)
+
